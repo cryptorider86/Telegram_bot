@@ -14,6 +14,10 @@ from enum import Enum
 import pandas as pd
 import numpy as np
 from abc import ABC, abstractmethod
+try:
+    import ccxt  # type: ignore
+except Exception:  # pragma: no cover
+    ccxt = None
 
 
 class OrderType(Enum):
@@ -629,6 +633,83 @@ class MockDataProvider(DataProvider):
         return np.random.uniform(100, 200)
 
 
+class CCXTDataProvider(DataProvider):
+    """Data provider using CCXT exchange clients (e.g., OKX, MEXC)."""
+    def __init__(self, exchange_id: str, market_type: str = "spot", enable_rate_limit: bool = True):
+        if ccxt is None:
+            raise RuntimeError("ccxt is not installed. Please install ccxt to use CCXTDataProvider.")
+        self.exchange_id = exchange_id
+        self.market_type = market_type
+        self.logger = logging.getLogger(__name__)
+        cls = getattr(ccxt, exchange_id)
+        self.exchange = cls({
+            'enableRateLimit': enable_rate_limit,
+            'options': {
+                'defaultType': market_type
+            }
+        })
+        try:
+            self.exchange.load_markets()
+        except Exception as e:
+            self.logger.warning(f"Failed to load markets for {exchange_id}: {e}")
+        
+    def _build_df(self, ohlcv: List[List[Any]]) -> pd.DataFrame:
+        if not ohlcv:
+            return pd.DataFrame(columns=['open', 'high', 'low', 'close', 'volume'])
+        arr = np.array(ohlcv)
+        # CCXT OHLCV: [timestamp, open, high, low, close, volume]
+        ts = pd.to_datetime(arr[:, 0], unit='ms')
+        df = pd.DataFrame({
+            'open': arr[:, 1].astype(float),
+            'high': arr[:, 2].astype(float),
+            'low': arr[:, 3].astype(float),
+            'close': arr[:, 4].astype(float),
+            'volume': arr[:, 5].astype(float),
+        }, index=ts)
+        return df
+    
+    def get_ohlcv(self, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
+        try:
+            # Many exchanges accept '1m' as timeframe
+            candles = self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+            return self._build_df(candles)
+        except Exception as e:
+            self.logger.warning(f"{self.exchange_id} get_ohlcv failed for {symbol}: {e}")
+            return pd.DataFrame(columns=['open', 'high', 'low', 'close', 'volume'])
+    
+    def get_current_price(self, symbol: str) -> float:
+        try:
+            ticker = self.exchange.fetch_ticker(symbol)
+            last = ticker.get('last') or ticker.get('close') or 0.0
+            return float(last) if last else 0.0
+        except Exception as e:
+            self.logger.warning(f"{self.exchange_id} get_current_price failed for {symbol}: {e}")
+            return 0.0
+
+
+class CompositeDataProvider(DataProvider):
+    """Tries multiple providers in order, returns first successful result."""
+    def __init__(self, providers: List[DataProvider]):
+        self.providers = providers
+        self.logger = logging.getLogger(__name__)
+    
+    def get_ohlcv(self, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
+        for p in self.providers:
+            df = p.get_ohlcv(symbol, timeframe, limit)
+            if not df.empty:
+                return df
+        self.logger.warning(f"All providers failed to fetch OHLCV for {symbol}")
+        return pd.DataFrame(columns=['open', 'high', 'low', 'close', 'volume'])
+    
+    def get_current_price(self, symbol: str) -> float:
+        for p in self.providers:
+            price = p.get_current_price(symbol)
+            if price and price > 0:
+                return price
+        self.logger.warning(f"All providers failed to fetch price for {symbol}")
+        return 0.0
+
+
 class MockExchange(ExchangeInterface):
     """Mock exchange interface for testing."""
     
@@ -718,7 +799,17 @@ def main():
         )
         
         # Initialize components
-        data_provider = MockDataProvider()
+        data_providers: List[DataProvider] = []
+        try:
+            if ccxt is not None:
+                # OKX and MEXC spot as data sources
+                data_providers.append(CCXTDataProvider('okx', market_type='spot'))
+                data_providers.append(CCXTDataProvider('mexc', market_type='spot'))
+        except Exception as e:
+            logger.warning(f"Failed to init CCXT providers: {e}")
+        # Always add mock as fallback
+        data_providers.append(MockDataProvider())
+        data_provider = CompositeDataProvider(data_providers)
         exchange = MockExchange()
         
         # Create strategy
